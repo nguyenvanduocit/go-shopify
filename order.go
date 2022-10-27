@@ -1,7 +1,9 @@
 package goshopify
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -15,10 +17,14 @@ const ordersResourceName = "orders"
 // See: https://help.shopify.com/api/reference/order
 type OrderService interface {
 	List(interface{}) ([]Order, error)
+	ListWithPagination(interface{}) ([]Order, *Pagination, error)
 	Count(interface{}) (int, error)
 	Get(int64, interface{}) (*Order, error)
 	Create(Order) (*Order, error)
 	Update(Order) (*Order, error)
+	Cancel(int64, interface{}) (*Order, error)
+	Close(int64) (*Order, error)
+	Open(int64) (*Order, error)
 
 	// MetafieldsService used for Order resource to communicate with Metafields resource
 	MetafieldsService
@@ -52,20 +58,24 @@ type OrderCountOptions struct {
 // A struct for all available order list options.
 // See: https://help.shopify.com/api/reference/order#index
 type OrderListOptions struct {
-	Page              int       `url:"page,omitempty"`
-	Limit             int       `url:"limit,omitempty"`
-	SinceID           int64     `url:"since_id,omitempty"`
+	ListOptions
 	Status            string    `url:"status,omitempty"`
 	FinancialStatus   string    `url:"financial_status,omitempty"`
 	FulfillmentStatus string    `url:"fulfillment_status,omitempty"`
-	CreatedAtMin      time.Time `url:"created_at_min,omitempty"`
-	CreatedAtMax      time.Time `url:"created_at_max,omitempty"`
-	UpdatedAtMin      time.Time `url:"updated_at_min,omitempty"`
-	UpdatedAtMax      time.Time `url:"updated_at_max,omitempty"`
 	ProcessedAtMin    time.Time `url:"processed_at_min,omitempty"`
 	ProcessedAtMax    time.Time `url:"processed_at_max,omitempty"`
-	Fields            string    `url:"fields,omitempty"`
 	Order             string    `url:"order,omitempty"`
+}
+
+// A struct of all available order cancel options.
+// See: https://help.shopify.com/api/reference/order#index
+type OrderCancelOptions struct {
+	Amount   *decimal.Decimal `json:"amount,omitempty"`
+	Currency string           `json:"currency,omitempty"`
+	Restock  bool             `json:"restock,omitempty"`
+	Reason   string           `json:"reason,omitempty"`
+	Email    bool             `json:"email,omitempty"`
+	Refund   *Refund          `json:"refund,omitempty"`
 }
 
 // Order represents a Shopify order
@@ -161,32 +171,88 @@ type DiscountCode struct {
 }
 
 type LineItem struct {
-	ID                         int64            `json:"id,omitempty"`
-	ProductID                  int64            `json:"product_id,omitempty"`
-	VariantID                  int64            `json:"variant_id,omitempty"`
-	Quantity                   int              `json:"quantity,omitempty"`
-	Price                      *decimal.Decimal `json:"price,omitempty"`
-	TotalDiscount              *decimal.Decimal `json:"total_discount,omitempty"`
-	Title                      string           `json:"title,omitempty"`
-	VariantTitle               string           `json:"variant_title,omitempty"`
-	Name                       string           `json:"name,omitempty"`
-	SKU                        string           `json:"sku,omitempty"`
-	Vendor                     string           `json:"vendor,omitempty"`
-	GiftCard                   bool             `json:"gift_card,omitempty"`
-	Taxable                    bool             `json:"taxable,omitempty"`
-	FulfillmentService         string           `json:"fulfillment_service,omitempty"`
-	RequiresShipping           bool             `json:"requires_shipping,omitempty"`
-	VariantInventoryManagement string           `json:"variant_inventory_management,omitempty"`
-	PreTaxPrice                *decimal.Decimal `json:"pre_tax_price,omitempty"`
-	Properties                 []NoteAttribute  `json:"properties,omitempty"`
-	ProductExists              bool             `json:"product_exists,omitempty"`
-	FulfillableQuantity        int              `json:"fulfillable_quantity,omitempty"`
-	Grams                      int              `json:"grams,omitempty"`
-	FulfillmentStatus          string           `json:"fulfillment_status,omitempty"`
-	TaxLines                   []TaxLine        `json:"tax_lines,omitempty"`
-	OriginLocation             *Address         `json:"origin_location,omitempty"`
-	DestinationLocation        *Address         `json:"destination_location,omitempty"`
-	AppliedDiscount            *AppliedDiscount `json:"applied_discount,omitempty"`
+	ID                         int64                 `json:"id,omitempty"`
+	ProductID                  int64                 `json:"product_id,omitempty"`
+	VariantID                  int64                 `json:"variant_id,omitempty"`
+	Quantity                   int                   `json:"quantity,omitempty"`
+	Price                      *decimal.Decimal      `json:"price,omitempty"`
+	TotalDiscount              *decimal.Decimal      `json:"total_discount,omitempty"`
+	Title                      string                `json:"title,omitempty"`
+	VariantTitle               string                `json:"variant_title,omitempty"`
+	Name                       string                `json:"name,omitempty"`
+	SKU                        string                `json:"sku,omitempty"`
+	Vendor                     string                `json:"vendor,omitempty"`
+	GiftCard                   bool                  `json:"gift_card,omitempty"`
+	Taxable                    bool                  `json:"taxable,omitempty"`
+	FulfillmentService         string                `json:"fulfillment_service,omitempty"`
+	RequiresShipping           bool                  `json:"requires_shipping,omitempty"`
+	VariantInventoryManagement string                `json:"variant_inventory_management,omitempty"`
+	PreTaxPrice                *decimal.Decimal      `json:"pre_tax_price,omitempty"`
+	Properties                 []NoteAttribute       `json:"properties,omitempty"`
+	ProductExists              bool                  `json:"product_exists,omitempty"`
+	FulfillableQuantity        int                   `json:"fulfillable_quantity,omitempty"`
+	Grams                      int                   `json:"grams,omitempty"`
+	FulfillmentStatus          string                `json:"fulfillment_status,omitempty"`
+	TaxLines                   []TaxLine             `json:"tax_lines,omitempty"`
+	OriginLocation             *Address              `json:"origin_location,omitempty"`
+	DestinationLocation        *Address              `json:"destination_location,omitempty"`
+	AppliedDiscount            *AppliedDiscount      `json:"applied_discount,omitempty"`
+	DiscountAllocations        []DiscountAllocations `json:"discount_allocations,omitempty"`
+}
+
+type DiscountAllocations struct {
+	Amount                   *decimal.Decimal `json:"amount,omitempty"`
+	DiscountApplicationIndex int              `json:"discount_application_index,omitempty"`
+	AmountSet                AmountSet        `json:"amount_set,omitempty"`
+}
+
+type AmountSet struct {
+	ShopMoney        AmountSetEntry `json:"shop_money,omitempty"`
+	PresentmentMoney AmountSetEntry `json:"presentment_money,omitempty"`
+}
+
+type AmountSetEntry struct {
+	Amount       *decimal.Decimal `json:"amount,omitempty"`
+	CurrencyCode string           `json:"currency_code,omitempty"`
+}
+
+// UnmarshalJSON custom unmarsaller for LineItem required to mitigate some older orders having LineItem.Properies
+// which are empty JSON objects rather than the expected array.
+func (li *LineItem) UnmarshalJSON(data []byte) error {
+	type alias LineItem
+	aux := &struct {
+		Properties json.RawMessage `json:"properties"`
+		*alias
+	}{alias: (*alias)(li)}
+
+	err := json.Unmarshal(data, &aux)
+	if err != nil {
+		return err
+	}
+
+	if len(aux.Properties) == 0 {
+		return nil
+	} else if aux.Properties[0] == '[' { // if the first character is a '[' we unmarshal into an array
+		var p []NoteAttribute
+		err = json.Unmarshal(aux.Properties, &p)
+		if err != nil {
+			return err
+		}
+		li.Properties = p
+	} else { // else we unmarshal it into a struct
+		var p NoteAttribute
+		err = json.Unmarshal(aux.Properties, &p)
+		if err != nil {
+			return err
+		}
+		if p.Name == "" && p.Value == nil { // if the struct is empty we set properties to nil
+			li.Properties = nil
+		} else {
+			li.Properties = []NoteAttribute{p} // else we set them to an array with the property nested
+		}
+	}
+
+	return nil
 }
 
 type LineItemProperty struct {
@@ -229,6 +295,30 @@ type ShippingLines struct {
 	TaxLines                      []TaxLine        `json:"tax_lines,omitempty"`
 }
 
+// UnmarshalJSON custom unmarshaller for ShippingLines implemented to handle requested_fulfillment_service_id being
+// returned as json numbers or json nulls instead of json strings
+func (sl *ShippingLines) UnmarshalJSON(data []byte) error {
+	type alias ShippingLines
+	aux := &struct {
+		*alias
+		RequestedFulfillmentServiceID interface{} `json:"requested_fulfillment_service_id"`
+	}{alias: (*alias)(sl)}
+
+	err := json.Unmarshal(data, &aux)
+	if err != nil {
+		return err
+	}
+
+	switch aux.RequestedFulfillmentServiceID.(type) {
+	case nil:
+		sl.RequestedFulfillmentServiceID = ""
+	default:
+		sl.RequestedFulfillmentServiceID = fmt.Sprintf("%v", aux.RequestedFulfillmentServiceID)
+	}
+
+	return nil
+}
+
 type TaxLine struct {
 	Title string           `json:"title,omitempty"`
 	Price *decimal.Decimal `json:"price,omitempty"`
@@ -253,6 +343,7 @@ type Transaction struct {
 	DeviceID       *int64           `json:"device_id,omitempty"`
 	ErrorCode      string           `json:"error_code,omitempty"`
 	SourceName     string           `json:"source_name,omitempty"`
+	Source         string           `json:"source,omitempty"`
 	PaymentDetails *PaymentDetails  `json:"payment_details,omitempty"`
 }
 
@@ -287,10 +378,32 @@ type RefundLineItem struct {
 
 // List orders
 func (s *OrderServiceOp) List(options interface{}) ([]Order, error) {
+	orders, _, err := s.ListWithPagination(options)
+	if err != nil {
+		return nil, err
+	}
+	return orders, nil
+}
+
+func (s *OrderServiceOp) ListWithPagination(options interface{}) ([]Order, *Pagination, error) {
 	path := fmt.Sprintf("%s.json", ordersBasePath)
 	resource := new(OrdersResource)
-	err := s.client.Get(path, resource, options)
-	return resource.Orders, err
+	headers := http.Header{}
+
+	headers, err := s.client.createAndDoGetHeaders("GET", path, nil, options, resource)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Extract pagination info from header
+	linkHeader := headers.Get("Link")
+
+	pagination, err := extractPagination(linkHeader)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return resource.Orders, pagination, nil
 }
 
 // Count orders
@@ -322,6 +435,30 @@ func (s *OrderServiceOp) Update(order Order) (*Order, error) {
 	wrappedData := OrderResource{Order: &order}
 	resource := new(OrderResource)
 	err := s.client.Put(path, wrappedData, resource)
+	return resource.Order, err
+}
+
+// Cancel order
+func (s *OrderServiceOp) Cancel(orderID int64, options interface{}) (*Order, error) {
+	path := fmt.Sprintf("%s/%d/cancel.json", ordersBasePath, orderID)
+	resource := new(OrderResource)
+	err := s.client.Post(path, options, resource)
+	return resource.Order, err
+}
+
+// Close order
+func (s *OrderServiceOp) Close(orderID int64) (*Order, error) {
+	path := fmt.Sprintf("%s/%d/close.json", ordersBasePath, orderID)
+	resource := new(OrderResource)
+	err := s.client.Post(path, nil, resource)
+	return resource.Order, err
+}
+
+// Open order
+func (s *OrderServiceOp) Open(orderID int64) (*Order, error) {
+	path := fmt.Sprintf("%s/%d/open.json", ordersBasePath, orderID)
+	resource := new(OrderResource)
+	err := s.client.Post(path, nil, resource)
 	return resource.Order, err
 }
 

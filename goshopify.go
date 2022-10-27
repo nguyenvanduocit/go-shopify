@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -21,6 +22,8 @@ import (
 
 const (
 	UserAgent = "goshopify/1.0.0"
+	// UnstableApiVersion Shopify API version for accessing unstable API features
+	UnstableApiVersion = "unstable"
 
 	// Shopify API version YYYY-MM - defaults to admin which uses the oldest stable version of the api
 	defaultApiPathPrefix = "admin"
@@ -54,6 +57,7 @@ type RateLimitInfo struct {
 type Client struct {
 	// HTTP client used to communicate with the Shopify API.
 	Client *http.Client
+	log    LeveledLoggerInterface
 
 	// App settings
 	app App
@@ -72,6 +76,10 @@ type Client struct {
 	// A permanent access token
 	token string
 
+	// max number of retries, defaults to 0 for no retries see WithRetry option
+	retries  int
+	attempts int
+
 	RateLimits RateLimitInfo
 
 	// Services used for communicating with the API
@@ -81,6 +89,7 @@ type Client struct {
 	Customer                   CustomerService
 	CustomerAddress            CustomerAddressService
 	Order                      OrderService
+	Fulfillment                FulfillmentService
 	DraftOrder                 DraftOrderService
 	Shop                       ShopService
 	Webhook                    WebhookService
@@ -99,9 +108,14 @@ type Client struct {
 	Page                       PageService
 	StorefrontAccessToken      StorefrontAccessTokenService
 	Collect                    CollectService
+	Collection                 CollectionService
 	Location                   LocationService
 	DiscountCode               DiscountCodeService
+	PriceRule                  PriceRuleService
 	InventoryItem              InventoryItemService
+	ShippingZone               ShippingZoneService
+	ProductListing             ProductListingService
+	AccessScopes               AccessScopesService
 }
 
 // A general response error that follows a similar layout to Shopify's response
@@ -215,21 +229,6 @@ func (c *Client) NewRequest(method, relPath string, body, options interface{}) (
 	return req, nil
 }
 
-// Option is used to configure client with options
-type Option func(c *Client)
-
-// WithVersion optionally sets the api-version if the passed string is valid
-func WithVersion(apiVersion string) Option {
-	return func(c *Client) {
-		pathPrefix := defaultApiPathPrefix
-		if len(apiVersion) > 0 && apiVersionRegex.MatchString(apiVersion) {
-			pathPrefix = fmt.Sprintf("admin/api/%s", apiVersion)
-		}
-		c.apiVersion = apiVersion
-		c.pathPrefix = pathPrefix
-	}
-}
-
 // NewClient returns a new Shopify API client with an already authenticated shopname and
 // token. The shopName parameter is the shop's myshopify domain,
 // e.g. "theshop.myshopify.com", or simply "theshop"
@@ -251,6 +250,7 @@ func NewClient(app App, shopName, token string, opts ...Option) *Client {
 		Client: &http.Client{
 			Timeout: time.Second * defaultHttpTimeout,
 		},
+		log:        &LeveledLogger{},
 		app:        app,
 		baseURL:    baseURL,
 		token:      token,
@@ -264,6 +264,7 @@ func NewClient(app App, shopName, token string, opts ...Option) *Client {
 	c.Customer = &CustomerServiceOp{client: c}
 	c.CustomerAddress = &CustomerAddressServiceOp{client: c}
 	c.Order = &OrderServiceOp{client: c}
+	c.Fulfillment = &FulfillmentServiceOp{client: c}
 	c.DraftOrder = &DraftOrderServiceOp{client: c}
 	c.Shop = &ShopServiceOp{client: c}
 	c.Webhook = &WebhookServiceOp{client: c}
@@ -282,9 +283,14 @@ func NewClient(app App, shopName, token string, opts ...Option) *Client {
 	c.StorefrontAccessToken = &StorefrontAccessTokenServiceOp{client: c}
 	c.UsageCharge = &UsageChargeServiceOp{client: c}
 	c.Collect = &CollectServiceOp{client: c}
+	c.Collection = &CollectionServiceOp{client: c}
 	c.Location = &LocationServiceOp{client: c}
 	c.DiscountCode = &DiscountCodeServiceOp{client: c}
+	c.PriceRule = &PriceRuleServiceOp{client: c}
 	c.InventoryItem = &InventoryItemServiceOp{client: c}
+	c.ShippingZone = &ShippingZoneServiceOp{client: c}
+	c.ProductListing = &ProductListingServiceOp{client: c}
+	c.AccessScopes = &AccessScopesServiceOp{client: c}
 
 	// apply any options
 	for _, opt := range opts {
@@ -308,20 +314,65 @@ func (c *Client) Do(req *http.Request, v interface{}) error {
 
 // doGetHeaders executes a request, decoding the response into `v` and also returns any response headers.
 func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, error) {
-	resp, err := c.Client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	var resp *http.Response
+	var err error
+	retries := c.retries
+	c.attempts = 0
+	c.logRequest(req)
 
-	err = CheckResponseError(resp)
-	if err != nil {
-		return nil, err
+	for {
+		c.attempts++
+		resp, err = c.Client.Do(req)
+		c.logResponse(resp)
+		if err != nil {
+			return nil, err // http client errors, not api responses
+		}
+
+		respErr := CheckResponseError(resp)
+		if respErr == nil {
+			break // no errors, break out of the retry loop
+		}
+
+		// retry scenario, close resp and any continue will retry
+		resp.Body.Close()
+
+		if retries <= 1 {
+			return nil, respErr
+		}
+
+		if rateLimitErr, isRetryErr := respErr.(RateLimitError); isRetryErr {
+			// back off and retry
+
+			wait := time.Duration(rateLimitErr.RetryAfter) * time.Second
+			c.log.Debugf("rate limited waiting %s", wait.String())
+			time.Sleep(wait)
+			retries--
+			continue
+		}
+
+		var doRetry bool
+		switch resp.StatusCode {
+		case http.StatusServiceUnavailable:
+			c.log.Debugf("service unavailable, retrying")
+			doRetry = true
+			retries--
+		}
+
+		if doRetry {
+			continue
+		}
+
+		// no retry attempts, just return the err
+		return nil, respErr
 	}
+
+	c.logResponse(resp)
+	defer resp.Body.Close()
 
 	if c.apiVersion == defaultApiVersion && resp.Header.Get("X-Shopify-API-Version") != "" {
 		// if using stable on first request set the api version
 		c.apiVersion = resp.Header.Get("X-Shopify-API-Version")
+		c.log.Infof("api version not set, now using %s", c.apiVersion)
 	}
 
 	if v != nil {
@@ -342,22 +393,60 @@ func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, er
 	return resp.Header, nil
 }
 
+func (c *Client) logRequest(req *http.Request) {
+	if req == nil {
+		return
+	}
+	if req.URL != nil {
+		c.log.Debugf("%s: %s", req.Method, req.URL.String())
+	}
+	c.logBody(&req.Body, "SENT: %s")
+}
+
+func (c *Client) logResponse(res *http.Response) {
+	if res == nil {
+		return
+	}
+	c.log.Debugf("RECV %d: %s", res.StatusCode, res.Status)
+	c.logBody(&res.Body, "RESP: %s")
+}
+
+func (c *Client) logBody(body *io.ReadCloser, format string) {
+	if body == nil {
+		return
+	}
+	b, _ := ioutil.ReadAll(*body)
+	if len(b) > 0 {
+		c.log.Debugf(format, string(b))
+	}
+	*body = ioutil.NopCloser(bytes.NewBuffer(b))
+}
+
 func wrapSpecificError(r *http.Response, err ResponseError) error {
-	if err.Status == 429 {
-		f, _ := strconv.ParseFloat(r.Header.Get("retry-after"), 64)
+	// see https://www.shopify.dev/concepts/about-apis/response-codes
+	if err.Status == http.StatusTooManyRequests {
+		f, _ := strconv.ParseFloat(r.Header.Get("Retry-After"), 64)
 		return RateLimitError{
 			ResponseError: err,
 			RetryAfter:    int(f),
 		}
 	}
-	if err.Status == 406 {
-		err.Message = "Not acceptable"
+
+	// if err.Status == http.StatusSeeOther {
+	// todo
+	// The response to the request can be found under a different URL in the
+	// Location header and can be retrieved using a GET method on that resource.
+	// }
+
+	if err.Status == http.StatusNotAcceptable {
+		err.Message = http.StatusText(err.Status)
 	}
+
 	return err
 }
 
 func CheckResponseError(r *http.Response) error {
-	if r.StatusCode >= 200 && r.StatusCode < 300 {
+	if http.StatusOK <= r.StatusCode && r.StatusCode < http.StatusMultipleChoices {
 		return nil
 	}
 
@@ -424,9 +513,10 @@ func CheckResponseError(r *http.Response) error {
 		// A map, parse each error for each key in the map.
 		// json always serializes into map[string]interface{} for objects
 		for k, v := range shopifyError.Errors.(map[string]interface{}) {
+			switch reflect.TypeOf(v).Kind() {
 			// Check to make sure the interface is a slice
 			// json always serializes JSON arrays into []interface{}
-			if reflect.TypeOf(v).Kind() == reflect.Slice {
+			case reflect.Slice:
 				for _, elem := range v.([]interface{}) {
 					// If the primary message of the response error is not set, use
 					// any message.
@@ -436,6 +526,13 @@ func CheckResponseError(r *http.Response) error {
 					topicAndElem := fmt.Sprintf("%v: %v", k, elem)
 					responseError.Errors = append(responseError.Errors, topicAndElem)
 				}
+			case reflect.String:
+				elem := v.(string)
+				if responseError.Message == "" {
+					responseError.Message = fmt.Sprintf("%v: %v", k, elem)
+				}
+				topicAndElem := fmt.Sprintf("%v: %v", k, elem)
+				responseError.Errors = append(responseError.Errors, topicAndElem)
 			}
 		}
 	}
